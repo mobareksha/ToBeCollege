@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+
+# Local captures, recognition output, and screen coordinates
+last_capture.png
+last_grid.png
+last_grid.json
+last_recognition.json
+grid_region.json
+
+# Local rollback copies
+sum10_grid_bot_before_*.py
