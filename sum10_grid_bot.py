@@ -449,6 +449,7 @@ class _PlanState:
     isolated_high: int
     fragile_high: int
     shortage: float
+    island_risk: float
 
 
 def _inventory_shortage(counts: tuple[int, ...]) -> float:
@@ -513,6 +514,72 @@ class _PlanSearch:
     def counts(self, mask: int) -> tuple[int, ...]:
         return tuple((mask & digit_mask).bit_count() for digit_mask in self.digit_masks)
 
+    def late_island_risk(self, mask: int, moves: tuple[_PlanMove, ...]) -> float:
+        """Estimate whether small late-game groups have lost their exits.
+
+        Cells linked by a currently legal rectangle belong to the same group.
+        Once a small group has few such links and its digit sum is not a
+        multiple of ten, clearing it completely would require a later bridge.
+        A bridge can still appear after other cells disappear, so this is a
+        soft penalty, applied only in the late game rather than a verdict.
+        """
+        if mask.bit_count() > 64:
+            return 0.0
+
+        active: list[int] = []
+        bits = mask
+        while bits:
+            bit = bits & -bits
+            active.append(bit.bit_length() - 1)
+            bits ^= bit
+        parent = {cell: cell for cell in active}
+
+        def find(cell: int) -> int:
+            while parent[cell] != cell:
+                parent[cell] = parent[parent[cell]]
+                cell = parent[cell]
+            return cell
+
+        def union(left: int, right: int) -> None:
+            left, right = find(left), find(right)
+            if left != right:
+                parent[right] = left
+
+        for move in moves:
+            cells: list[int] = []
+            bits = move.mask
+            while bits:
+                bit = bits & -bits
+                cells.append(bit.bit_length() - 1)
+                bits ^= bit
+            for cell in cells[1:]:
+                union(cells[0], cell)
+
+        component_size: dict[int, int] = {}
+        component_sum: dict[int, int] = {}
+        component_moves: dict[int, int] = {}
+        for cell in active:
+            root = find(cell)
+            component_size[root] = component_size.get(root, 0) + 1
+            component_sum[root] = component_sum.get(root, 0) + self.values[cell]
+        for move in moves:
+            first_cell = (move.mask & -move.mask).bit_length() - 1
+            root = find(first_cell)
+            component_moves[root] = component_moves.get(root, 0) + 1
+
+        risk = 0.0
+        for root, size in component_size.items():
+            move_count = component_moves.get(root, 0)
+            # Ignore single cells and flexible or board-wide groups.  These are
+            # not the compact residual islands this guard is intended to catch.
+            if not 3 <= size <= 32 or move_count > max(6, size):
+                continue
+            if component_sum[root] % 10:
+                risk += 1.0 + 0.08 * size
+            if move_count <= 1:
+                risk += 0.45
+        return risk
+
     def _analyze(self, mask: int) -> _PlanState:
         values = np.fromiter(
             (value if mask & (1 << i) else 0 for i, value in enumerate(self.values)),
@@ -543,10 +610,11 @@ class _PlanSearch:
             twice |= covered & removed
             covered |= removed
         counts = self.counts(mask)
-        return _PlanState(tuple(unique.values()), counts, mask.bit_count(), covered.bit_count(),
+        moves = tuple(unique.values())
+        return _PlanState(moves, counts, mask.bit_count(), covered.bit_count(),
                           (mask & self.high_mask & ~covered).bit_count(),
                           (mask & self.high_mask & covered & ~twice).bit_count(),
-                          self.inventory(counts))
+                          self.inventory(counts), self.late_island_risk(mask, moves))
 
     def rank_moves(self, state: _PlanState, policy: int = 0) -> list[_PlanMove]:
         def score(move: _PlanMove) -> tuple[float, int, int]:
@@ -572,14 +640,15 @@ class _PlanSearch:
         # Uncovered != permanently dead: penalize only softly. Counts of
         # currently legal moves are secondary to distinct covered cells.
         if policy == 1:
-            return cleared + 0.32*state.covered - 0.35*state.shortage
+            return cleared + 0.32*state.covered - 0.35*state.shortage - 0.30*state.island_risk
         if policy == 2:
             return (cleared + 0.35*state.covered + 1.20*high_cleared
                     - 3.10*state.shortage - 0.42*state.isolated_high
-                    - 0.12*state.fragile_high)
+                    - 0.12*state.fragile_high - 0.55*state.island_risk)
         return (cleared + 0.60*state.covered + 0.65*high_cleared
                 - 1.7*state.shortage - 0.18*state.isolated_high
-                - 0.06*state.fragile_high + 0.015*min(len(state.moves), 80))
+                - 0.06*state.fragile_high - 0.40*state.island_risk
+                + 0.015*min(len(state.moves), 80))
 
 
 def build_optimized_plan(
@@ -636,7 +705,8 @@ def build_optimized_plan(
         state = engine.analyze(mask)
         key = (initial_count-mask.bit_count(),
                ((engine.initial ^ mask) & engine.high_mask).bit_count(),
-               -round(state.shortage * 100), -state.isolated_high)
+               -round(state.shortage * 100), -state.isolated_high,
+               -round(state.island_risk * 100))
         if key > best_key:
             best_key, best_plan = key, plan
 
