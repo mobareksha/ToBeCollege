@@ -681,8 +681,60 @@ def build_optimized_plan(
         if best_key[0] == initial_count or out_of_budget():
             break
 
-    # Keep half the beam under each evaluation to reduce one-heuristic bias.
-    frontier = [(engine.initial, ())]
+    # Deliberately diversify the opening.  A normal beam starts with the same
+    # few highest-scoring moves, so its later branches differ only cosmetically.
+    # Here every protected root is a genuinely different first move.  We keep
+    # each root alive for a handful of moves, then merge equal states normally.
+    root_state = engine.analyze(engine.initial)
+    root_rankings = [engine.rank_moves(root_state, policy) for policy in (0, 1, 2)]
+    root_moves: list[_PlanMove] = []
+    root_seen: set[int] = set()
+
+    def add_root(move: _PlanMove | None) -> None:
+        if move is not None and move.mask not in root_seen:
+            root_seen.add(move.mask)
+            root_moves.append(move)
+
+    # Treating 9, 8, 7 and the three rankings as separate openings prevents
+    # one early heuristic from deciding the entire game.
+    for digit in (9, 8, 7):
+        add_root(next((move for move in root_rankings[0] if move.counts[digit]), None))
+    for ranking in root_rankings:
+        add_root(ranking[0] if ranking else None)
+
+    # Add spatially separated candidates, then fill with moves that overlap
+    # the already selected roots as little as possible.
+    rows, cols = len(grid), len(grid[0])
+    pool: list[_PlanMove] = []
+    for ranking in root_rankings:
+        pool.extend(ranking[:max(16, candidate_pool * 4)])
+    for row_band in range(3):
+        candidates = [
+            move for move in pool
+            if min(2, (move.match.first[0] + move.match.second[0]) * 3 // (2 * rows)) == row_band
+        ]
+        add_root(candidates[0] if candidates else None)
+
+    root_limit = min(max(6, beam_width // 2), 12)
+    while len(root_moves) < root_limit:
+        candidates = [move for move in pool if move.mask not in root_seen]
+        if not candidates:
+            break
+        occupied_by_roots = 0
+        for chosen_root in root_moves:
+            occupied_by_roots |= chosen_root.mask
+        # Prefer a new opening that shares fewer initial cells with the roots
+        # already represented; ranking position only breaks the tie.
+        candidate = min(
+            candidates,
+            key=lambda move: ((move.mask & occupied_by_roots).bit_count(), -move.size, move.mask),
+        )
+        add_root(candidate)
+
+    for move in root_moves:
+        remember(engine.initial ^ move.mask, (move,))
+    protected_depth = min(5, max_actions)
+    frontier = [(engine.initial ^ move.mask, (move,), move.mask) for move in root_moves]
     exact_cache: dict[tuple[int, int], tuple[_PlanMove, ...]] = {}
     exact_nodes = 0
 
@@ -716,8 +768,9 @@ def build_optimized_plan(
     for depth in range(max_actions):
         if out_of_budget() or best_key[0] == initial_count or not frontier:
             break
-        children: dict[int, tuple[_PlanMove, ...]] = {}
-        for mask, plan in frontier:
+        protect_roots = depth < protected_depth
+        children: dict[tuple[int, int], tuple[_PlanMove, ...]] = {}
+        for mask, plan, root_id in frontier:
             if out_of_budget():
                 break
             state = engine.analyze(mask)
@@ -744,30 +797,40 @@ def build_optimized_plan(
                 selected.setdefault(move.mask, move)
             for move in selected.values():
                 child = mask ^ move.mask
-                if child not in children:
+                child_key = (child, root_id if protect_roots else 0)
+                if child_key not in children:
                     child_plan = plan + (move,)
-                    children[child] = child_plan
+                    children[child_key] = child_plan
                     remember(child, child_plan)
             report(f"beam depth={depth+1}")
         candidates = []
-        for mask, plan in children.items():
+        for (mask, root_id), plan in children.items():
             if out_of_budget():
                 break
             state = engine.analyze(mask)
             if state.moves and len(plan) < max_actions:
                 candidates.append((
-                    mask, plan,
+                    mask, plan, root_id,
                     engine.evaluate(mask, state),
                     engine.evaluate(mask, state, 1),
                     engine.evaluate(mask, state, 2),
                 ))
         width = beam_width * (2 if candidates and min(item[0].bit_count() for item in candidates) <= 32 else 1)
-        chosen = {}
+        chosen: dict[tuple[int, int], tuple[int, tuple[_PlanMove, ...], int]] = {}
+        if protect_roots:
+            # One best continuation per root means an unconventional opening
+            # cannot disappear merely because it scores lower after move two.
+            for root_id in {item[2] for item in candidates}:
+                root_candidates = [item for item in candidates if item[2] == root_id]
+                if root_candidates:
+                    best = max(root_candidates, key=lambda item: item[3])
+                    chosen[(best[0], root_id)] = (best[0], best[1], root_id)
         # The main beam retains V3's balance: half resource-aware, then
         # score-first and complement-protection paths.
-        for slot, target in ((2, (width + 1)//2), (3, (3*width + 3)//4), (4, width)):
+        for slot, target in ((3, (width + 1)//2), (4, (3*width + 3)//4), (5, width)):
             for item in sorted(candidates, key=lambda item: item[slot], reverse=True):
-                chosen.setdefault(item[0], (item[0], item[1]))
+                key = (item[0], item[2] if protect_roots else 0)
+                chosen.setdefault(key, (item[0], item[1], item[2]))
                 if len(chosen) >= target:
                     break
         frontier = list(chosen.values())
